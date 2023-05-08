@@ -1,5 +1,7 @@
 use crate::{
-    result::SuiteResult, test_suite::{TestRunEvent, TestSuite}, ContractRunner, TestFilter, TestOptions,
+    result::SuiteResult,
+    test_suite::{builder::TestSuiteBuilder, TestRunEvent},
+    ContractRunner, TestFilter, TestOptions,
 };
 use ethers::{
     abi::Abi,
@@ -19,8 +21,12 @@ use foundry_evm::{
 use foundry_utils::PostLinkInput;
 use rayon::prelude::*;
 use revm::primitives::SpecId;
-use std::{collections::BTreeMap, path::Path, sync::{mpsc::Sender, Arc, Mutex}, time::Duration};
-use tokio::net::unix::pipe::Receiver;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{mpsc::Sender},
+    time::Duration,
+};
 
 pub type DeployableContracts = BTreeMap<ArtifactId, (Abi, Bytes, Vec<Bytes>)>;
 
@@ -116,7 +122,6 @@ impl MultiContractRunner {
     pub fn test_new<F: TestFilter + Clone + 'static>(
         &mut self,
         filter: F,
-        stream_result: Option<Sender<(String, SuiteResult)>>,
         test_options: TestOptions,
     ) -> std::sync::mpsc::Receiver<TestRunEvent> {
         // TODO document bound = 0
@@ -125,37 +130,36 @@ impl MultiContractRunner {
 
         // TODO: Filter
         self.contracts.iter().for_each(|(id, (abi, deploy_code, libs))| {
-            let executor = ExecutorBuilder::default()
-                .with_cheatcodes(self.cheats_config.clone())
-                .with_config(self.env.clone())
-                .with_spec(self.evm_spec)
-                .with_gas_limit(self.evm_opts.gas_limit())
-                .set_tracing(self.evm_opts.verbosity >= 3)
-                .set_coverage(self.coverage)
-                .build(db.clone());
-
-            let filter = filter.clone();
-            let suite = TestSuite {
-                id: id.identifier(),
-                executor,
-                contract: abi.clone(), // TODO si può lavorare con reference?
-                deploy_code: deploy_code.clone(),
-                libs: libs.clone(),
-                filter,
-                test_opts: self.test_options,
-                timeout: Duration::from_secs(60), // TODO da dove possiamo leggerla?
-                complete: Arc::new(Mutex::new(false)), // TODO è privata, non inizializzarla qui
-                initial_balance: self.evm_opts.initial_balance,
-                sender: self.sender,
-                errors: self.errors.clone(),
-                known_contracts: self.known_contracts.clone(),
-            };
+            let suite = TestSuiteBuilder::default()
+                .id(id.identifier())
+                .executor(self.executor(&db))
+                .contract(abi.clone())
+                .deploy_code(deploy_code.clone())
+                .libs(libs.clone())
+                .test_options(test_options)
+                .timeout(Duration::from_secs(60))
+                .initial_balance(self.evm_opts.initial_balance)
+                .sender(self.sender)
+                .errors(self.errors.clone())
+                .known_contracts(self.known_contracts.clone())
+                .build(filter.clone());
 
             let tx = tx.clone();
             suite.run(tx);
         });
 
         rx
+    }
+
+    fn executor(&self, db: &Backend) -> Executor {
+        ExecutorBuilder::default()
+                .with_cheatcodes(self.cheats_config.clone())
+                .with_config(self.env.clone())
+                .with_spec(self.evm_spec)
+                .with_gas_limit(self.evm_opts.gas_limit())
+                .set_tracing(self.evm_opts.verbosity >= 3)
+                .set_coverage(self.coverage)
+                .build(db.clone())
     }
 
     /// Executes _all_ tests that match the given `filter`

@@ -16,6 +16,7 @@ pub enum TestRunEvent {
     ExecutionFinished(eyre::Result<SuiteResult>),
 }
 
+pub(crate) mod builder;
 pub(crate) struct TestSuite<F: TestFilter + 'static> {
     pub id: String,
     pub executor: Executor,
@@ -23,7 +24,7 @@ pub(crate) struct TestSuite<F: TestFilter + 'static> {
     pub deploy_code: Bytes,
     pub libs: Vec<Bytes>,
     pub filter: F,
-    pub test_opts: TestOptions,
+    pub test_options: TestOptions,
     pub timeout: Duration,
     pub complete: Arc<Mutex<bool>>,
     pub initial_balance: U256,
@@ -53,7 +54,7 @@ impl<F: TestFilter + 'static> TestSuite<F> {
         // TODO DOCS
         rayon::spawn(move || {
             let runner = self.runner();
-            let o = self.test_opts;
+            let o = self.test_options;
             let f = &self.filter;
             let kc = Some(&self.known_contracts);
             let result = runner.run_tests(f, o, kc);
