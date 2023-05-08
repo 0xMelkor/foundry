@@ -1,4 +1,6 @@
-use crate::{result::SuiteResult, ContractRunner, TestFilter, TestOptions};
+use crate::{
+    result::SuiteResult, test_suite::{TestRunEvent, TestSuite}, ContractRunner, TestFilter, TestOptions,
+};
 use ethers::{
     abi::Abi,
     prelude::{artifacts::CompactContractBytecode, ArtifactId, ArtifactOutput},
@@ -17,7 +19,8 @@ use foundry_evm::{
 use foundry_utils::PostLinkInput;
 use rayon::prelude::*;
 use revm::primitives::SpecId;
-use std::{collections::BTreeMap, path::Path, sync::mpsc::Sender};
+use std::{collections::BTreeMap, path::Path, sync::{mpsc::Sender, Arc, Mutex}, time::Duration};
+use tokio::net::unix::pipe::Receiver;
 
 pub type DeployableContracts = BTreeMap<ArtifactId, (Abi, Bytes, Vec<Bytes>)>;
 
@@ -57,8 +60,8 @@ impl MultiContractRunner {
         self.contracts
             .iter()
             .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
+                filter.matches_path(id.source.to_string_lossy())
+                    && filter.matches_contract(&id.name)
             })
             .flat_map(|(_, (abi, _, _))| {
                 abi.functions().filter(|func| filter.matches_test(func.signature()))
@@ -71,8 +74,8 @@ impl MultiContractRunner {
         self.contracts
             .iter()
             .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
+                filter.matches_path(id.source.to_string_lossy())
+                    && filter.matches_contract(&id.name)
             })
             .flat_map(|(_, (abi, _, _))| abi.functions().map(|func| func.name.clone()))
             .filter(|sig| sig.is_test())
@@ -87,8 +90,8 @@ impl MultiContractRunner {
         self.contracts
             .iter()
             .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
+                filter.matches_path(id.source.to_string_lossy())
+                    && filter.matches_contract(&id.name)
             })
             .filter(|(_, (abi, _, _))| abi.functions().any(|func| filter.matches_test(&func.name)))
             .map(|(id, (abi, _, _))| {
@@ -107,6 +110,52 @@ impl MultiContractRunner {
                 acc.entry(source).or_default().insert(name, tests);
                 acc
             })
+    }
+
+    // TODO: RENAME
+    pub fn test_new<F: TestFilter + Clone + 'static>(
+        &mut self,
+        filter: F,
+        stream_result: Option<Sender<(String, SuiteResult)>>,
+        test_options: TestOptions,
+    ) -> std::sync::mpsc::Receiver<TestRunEvent> {
+        // TODO document bound = 0
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TestRunEvent>(0);
+        let db = Backend::spawn(self.fork.take());
+
+        // TODO: Filter
+        self.contracts.iter().for_each(|(id, (abi, deploy_code, libs))| {
+            let executor = ExecutorBuilder::default()
+                .with_cheatcodes(self.cheats_config.clone())
+                .with_config(self.env.clone())
+                .with_spec(self.evm_spec)
+                .with_gas_limit(self.evm_opts.gas_limit())
+                .set_tracing(self.evm_opts.verbosity >= 3)
+                .set_coverage(self.coverage)
+                .build(db.clone());
+
+            let filter = filter.clone();
+            let suite = TestSuite {
+                id: id.identifier(),
+                executor,
+                contract: abi.clone(), // TODO si può lavorare con reference?
+                deploy_code: deploy_code.clone(),
+                libs: libs.clone(),
+                filter,
+                test_opts: self.test_options,
+                timeout: Duration::from_secs(60), // TODO da dove possiamo leggerla?
+                complete: Arc::new(Mutex::new(false)), // TODO è privata, non inizializzarla qui
+                initial_balance: self.evm_opts.initial_balance,
+                sender: self.sender,
+                errors: self.errors.clone(),
+                known_contracts: self.known_contracts.clone(),
+            };
+
+            let tx = tx.clone();
+            suite.run(tx);
+        });
+
+        rx
     }
 
     /// Executes _all_ tests that match the given `filter`
@@ -130,8 +179,8 @@ impl MultiContractRunner {
             .contracts
             .par_iter()
             .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
+                filter.matches_path(id.source.to_string_lossy())
+                    && filter.matches_contract(&id.name)
             })
             .filter(|(_, (abi, _, _))| abi.functions().any(|func| filter.matches_test(&func.name)))
             .map(|(id, (abi, deploy_code, libs))| {
@@ -272,13 +321,14 @@ impl MultiContractRunnerBuilder {
                     if let Some(b) = contract.bytecode.expect("No bytecode").object.into_bytes() {
                         b
                     } else {
-                        return Ok(())
+                        return Ok(());
                     };
 
                 let abi = contract.abi.expect("We should have an abi by now");
                 // if it's a test, add it to deployable contracts
-                if abi.constructor.as_ref().map(|c| c.inputs.is_empty()).unwrap_or(true) &&
-                    abi.functions()
+                if abi.constructor.as_ref().map(|c| c.inputs.is_empty()).unwrap_or(true)
+                    && abi
+                        .functions()
                         .any(|func| func.name.is_test() || func.name.is_invariant_test())
                 {
                     deployable_contracts.insert(

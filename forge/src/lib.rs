@@ -19,6 +19,7 @@ pub use multi_runner::{MultiContractRunner, MultiContractRunnerBuilder};
 pub use foundry_common::traits::TestFilter;
 
 pub mod result;
+mod test_suite;
 
 /// The Forge EVM backend
 pub use foundry_evm::*;
