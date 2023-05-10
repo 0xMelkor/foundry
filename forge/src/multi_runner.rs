@@ -1,6 +1,6 @@
 use crate::{
     result::SuiteResult,
-    test_suite::{builder::TestSuiteBuilder, TestRunEvent},
+    test_suite::{builder::TestSuiteBuilder, RunEvent},
     ContractRunner, TestFilter, TestOptions,
 };
 use ethers::{
@@ -21,12 +21,7 @@ use foundry_evm::{
 use foundry_utils::PostLinkInput;
 use rayon::prelude::*;
 use revm::primitives::SpecId;
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{mpsc::Sender},
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::Path, sync::mpsc::Sender, time::Duration};
 
 pub type DeployableContracts = BTreeMap<ArtifactId, (Abi, Bytes, Vec<Bytes>)>;
 
@@ -123,43 +118,45 @@ impl MultiContractRunner {
         &mut self,
         filter: F,
         test_options: TestOptions,
-    ) -> std::sync::mpsc::Receiver<TestRunEvent> {
-        // TODO document bound = 0
-        let (tx, rx) = std::sync::mpsc::sync_channel::<TestRunEvent>(0);
+    ) -> std::sync::mpsc::Receiver<RunEvent> {
+        let buffer_size = 0;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RunEvent>(buffer_size);
         let db = Backend::spawn(self.fork.take());
 
-        // TODO: Filter
-        self.contracts.iter().for_each(|(id, (abi, deploy_code, libs))| {
-            let suite = TestSuiteBuilder::default()
-                .id(id.identifier())
-                .executor(self.executor(&db))
-                .contract(abi.clone())
-                .deploy_code(deploy_code.clone())
-                .libs(libs.clone())
-                .test_options(test_options)
-                .timeout(Duration::from_secs(60))
-                .initial_balance(self.evm_opts.initial_balance)
-                .sender(self.sender)
-                .errors(self.errors.clone())
-                .known_contracts(self.known_contracts.clone())
-                .build(filter.clone());
+        self.contracts
+            .iter()
+            .filter(|(id, (abi, _, _))| contract_matches(id, abi, &filter))
+            .for_each(|(id, (abi, deploy_code, libs))| {
+                let suite = TestSuiteBuilder::default()
+                    .id(id.identifier())
+                    .executor(self.executor(&db))
+                    .contract(abi.clone())
+                    .deploy_code(deploy_code.clone())
+                    .libs(libs.clone())
+                    .test_options(test_options)
+                    .timeout(Duration::from_secs(60))
+                    .initial_balance(self.evm_opts.initial_balance)
+                    .sender(self.sender)
+                    .errors(self.errors.clone())
+                    .known_contracts(self.known_contracts.clone())
+                    .build(filter.clone());
 
-            let tx = tx.clone();
-            suite.run(tx);
-        });
+                let tx = tx.clone();
+                suite.run(tx);
+            });
 
         rx
     }
 
     fn executor(&self, db: &Backend) -> Executor {
         ExecutorBuilder::default()
-                .with_cheatcodes(self.cheats_config.clone())
-                .with_config(self.env.clone())
-                .with_spec(self.evm_spec)
-                .with_gas_limit(self.evm_opts.gas_limit())
-                .set_tracing(self.evm_opts.verbosity >= 3)
-                .set_coverage(self.coverage)
-                .build(db.clone())
+            .with_cheatcodes(self.cheats_config.clone())
+            .with_config(self.env.clone())
+            .with_spec(self.evm_spec)
+            .with_gas_limit(self.evm_opts.gas_limit())
+            .set_tracing(self.evm_opts.verbosity >= 3)
+            .set_coverage(self.coverage)
+            .build(db.clone())
     }
 
     /// Executes _all_ tests that match the given `filter`
@@ -170,14 +167,23 @@ impl MultiContractRunner {
     /// Each Executor gets its own instance of the `Backend`.
     pub fn test(
         &mut self,
-        filter: &impl TestFilter,
+        filter: &(impl TestFilter + Clone + 'static),
         stream_result: Option<Sender<(String, SuiteResult)>>,
         test_options: TestOptions,
     ) -> Result<BTreeMap<String, SuiteResult>> {
         tracing::trace!("start all tests");
+        let f = filter.clone();
+        let rx = self.test_new(f, test_options);
+        for msg in rx {
+            match msg {
+                RunEvent::Slow(payload) => println!("SLOW {:?}", payload.body),
+                RunEvent::Success(payload) => println!("SUCCESS {payload:?}"),
+                RunEvent::Error(payload) => println!("ERROR {payload:?}"),
+            }
+        }
 
         // the db backend that serves all the data, each contract gets its own instance
-        let db = Backend::spawn(self.fork.take());
+        /* let db = Backend::spawn(self.fork.take());
 
         let results = self
             .contracts
@@ -221,7 +227,8 @@ impl MultiContractRunner {
             })
             .collect::<BTreeMap<_, _>>();
 
-        Ok(results)
+        Ok(results)*/
+        Ok(BTreeMap::new())
     }
 
     // The _name field is unused because we only want it for tracing
@@ -251,6 +258,14 @@ impl MultiContractRunner {
         );
         runner.run_tests(filter, test_options, Some(&self.known_contracts))
     }
+}
+
+fn contract_matches(id: &ArtifactId, abi: &Abi, filter: &impl TestFilter) -> bool {
+    let path = id.source.to_string_lossy();
+    let name = &id.name;
+    filter.matches_path(path)
+        && filter.matches_contract(name)
+        && abi.functions().any(|f| filter.matches_test(&f.name))
 }
 
 /// Builder used for instantiating the multi-contract runner

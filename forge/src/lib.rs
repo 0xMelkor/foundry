@@ -20,6 +20,7 @@ pub use foundry_common::traits::TestFilter;
 
 pub mod result;
 mod test_suite;
+pub use test_suite::RunEvent;
 
 /// The Forge EVM backend
 pub use foundry_evm::*;

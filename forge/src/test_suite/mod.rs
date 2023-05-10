@@ -11,9 +11,17 @@ use ethers::{
 use foundry_common::{ContractsByArtifact, TestFilter};
 use foundry_evm::executor::Executor;
 
-pub enum TestRunEvent {
-    ExecutionSlow(String),
-    ExecutionFinished(eyre::Result<SuiteResult>),
+#[derive(Debug)]
+pub enum RunEvent {
+    Slow(Payload<Duration>),
+    Success(Payload<SuiteResult>),
+    Error(Payload<eyre::ErrReport>),
+}
+
+#[derive(Debug)]
+pub struct Payload<T: 'static> {
+    pub id: String,
+    pub body: T,
 }
 
 pub(crate) mod builder;
@@ -34,17 +42,21 @@ pub(crate) struct TestSuite<F: TestFilter + 'static> {
 }
 
 impl<F: TestFilter + 'static> TestSuite<F> {
-    pub fn run(self, tx: SyncSender<TestRunEvent>) {
+    /// TODO docs
+    pub fn run(self, tx: SyncSender<RunEvent>) {
         let id = self.id.clone();
         let complete = self.complete.clone();
         let timeout = self.timeout;
-        let tx_1: SyncSender<TestRunEvent> = tx.clone();
-
+        let timeout_secs = timeout.as_secs();
+        let tx_1: SyncSender<RunEvent> = tx.clone();
         // TODO DOCS
+        let mut slow_count = 0;
         rayon::spawn(move || loop {
             if !*complete.lock().unwrap() {
                 std::thread::sleep(timeout);
-                let evt = TestRunEvent::ExecutionSlow(id.clone());
+                let elapsed = timeout_secs * (1 + slow_count);
+                let body = Duration::from_secs(elapsed);
+                let evt = RunEvent::Slow(Payload { id: id.clone(), body });
                 tx_1.send(evt).unwrap();
             } else {
                 break;
@@ -52,15 +64,17 @@ impl<F: TestFilter + 'static> TestSuite<F> {
         });
 
         // TODO DOCS
+        let id = self.id.clone();
         rayon::spawn(move || {
-            let runner = self.runner();
-            let o = self.test_options;
-            let f = &self.filter;
-            let kc = Some(&self.known_contracts);
-            let result = runner.run_tests(f, o, kc);
+            match self.runner().run_tests(
+                &self.filter,
+                self.test_options,
+                Some(&self.known_contracts),
+            ) {
+                Ok(body) => tx.send(RunEvent::Success(Payload { id, body })).unwrap(),
+                Err(body) => tx.send(RunEvent::Error(Payload { id, body })).unwrap(),
+            }
 
-            let evt = TestRunEvent::ExecutionFinished(result);
-            tx.send(evt).unwrap();
             *self.complete.lock().unwrap() = true;
         });
     }
